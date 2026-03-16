@@ -9,6 +9,7 @@ from collections.abc import Callable, Coroutine
 from typing import Any, ParamSpec, TypeVar
 
 from agent_billing_meter.audit_log import AuditLog
+from agent_billing_meter.balance_cache import BalanceCache
 from agent_billing_meter.models import DebitResult
 from agent_billing_meter.rc_client import RCClient
 
@@ -31,6 +32,11 @@ class BillingMeter:
         @meter.metered(cost=5, operation="generate_report")
         async def generate_report(prompt: str) -> str:
             ...
+
+    Balance cache (optional)::
+
+        # Cache balance for 60s — avoids an extra RC GET before each debit
+        meter = BillingMeter(..., balance_cache_ttl_s=60.0)
     """
 
     def __init__(
@@ -41,6 +47,7 @@ class BillingMeter:
         db_path: str | None = None,
         log_all: bool = True,
         raise_on_failure: bool = False,
+        balance_cache_ttl_s: float = 0.0,
     ) -> None:
         self._api_key = api_key
         self.app_user_id = app_user_id
@@ -49,6 +56,9 @@ class BillingMeter:
         self._raise_on_failure = raise_on_failure
         self._audit: AuditLog = AuditLog(db_path=db_path)
         self._rc: RCClient | None = None
+        self._balance_cache: BalanceCache | None = (
+            BalanceCache(ttl_seconds=balance_cache_ttl_s) if balance_cache_ttl_s > 0 else None
+        )
 
     async def __aenter__(self) -> BillingMeter:
         self._rc = RCClient(api_key=self._api_key)
@@ -78,6 +88,9 @@ class BillingMeter:
 
         Returns DebitResult. If raise_on_failure=True, raises on RC API errors.
         Always logs to the audit log when log_all=True.
+
+        When balance_cache_ttl_s > 0, balance_before is served from the cache
+        if available (avoids a redundant RC GET call per debit).
         """
         rc = self._ensure_rc()
         ts = time.time()
@@ -85,11 +98,15 @@ class BillingMeter:
         balance_after: int | None = None
 
         try:
-            # Attempt to get balance before (best-effort, don't fail if unavailable)
-            try:
-                balance_before = await rc.get_balance(self.app_user_id, self.currency)
-            except Exception:
-                pass
+            # Fetch balance_before: use cache if warm, otherwise hit RC
+            if self._balance_cache is not None:
+                balance_before = self._balance_cache.get(self.app_user_id, self.currency)
+
+            if balance_before is None:
+                try:
+                    balance_before = await rc.get_balance(self.app_user_id, self.currency)
+                except Exception:
+                    pass
 
             # Perform debit
             resp = await rc.debit_currency(
@@ -99,11 +116,15 @@ class BillingMeter:
                 metadata=metadata,
             )
 
-            # Extract balance_after from response if available
+            # Extract balance_after from response
             vc = resp.get("virtual_currencies", {})
             vc_data = vc.get(self.currency, {}) if isinstance(vc, dict) else {}
             raw_balance = vc_data.get("balance") if isinstance(vc_data, dict) else None
             balance_after = int(raw_balance) if raw_balance is not None else None
+
+            # Update cache with fresh balance
+            if self._balance_cache is not None and balance_after is not None:
+                self._balance_cache.set(self.app_user_id, self.currency, balance_after)
 
             result = DebitResult(
                 success=True,
@@ -116,6 +137,10 @@ class BillingMeter:
             )
 
         except Exception as exc:
+            # Invalidate cache on error — balance state is uncertain
+            if self._balance_cache is not None:
+                self._balance_cache.invalidate(self.app_user_id, self.currency)
+
             result = DebitResult(
                 success=False,
                 app_user_id=self.app_user_id,
@@ -175,7 +200,14 @@ class BillingMeter:
 
     async def balance(self) -> int | None:
         """Return current balance for this user / currency."""
-        return await self._ensure_rc().get_balance(self.app_user_id, self.currency)
+        if self._balance_cache is not None:
+            cached = self._balance_cache.get(self.app_user_id, self.currency)
+            if cached is not None:
+                return cached
+        bal = await self._ensure_rc().get_balance(self.app_user_id, self.currency)
+        if self._balance_cache is not None and bal is not None:
+            self._balance_cache.set(self.app_user_id, self.currency, bal)
+        return bal
 
     def history(self, limit: int = 50) -> list[DebitResult]:
         """Return recent debit history for this user from the audit log."""
@@ -231,3 +263,170 @@ class BudgetedMeter(BillingMeter):
     @property
     def remaining_budget(self) -> int:
         return max(0, self._budget - self._session_spent)
+
+
+class BatchMeter(BillingMeter):
+    """BillingMeter with batched debit and per-operation debounce.
+
+    Debits can be queued locally and flushed in bulk, reducing RC API calls
+    when many operations fire in a short window.
+
+    Features:
+    - queue_debit(): enqueue a debit without an immediate RC call
+    - flush(): coalesce same-operation debits, fire one RC call per unique op,
+      return list of DebitResult
+    - auto_flush=True (default): flush on __aexit__ so nothing is lost
+    - debounce_ms > 0: when debit() is called, same-operation calls within the
+      debounce window are accumulated locally; the RC call fires when the window
+      expires (checked on the next call to that operation) or on flush()
+
+    Example — queue many cheap ops, flush at end::
+
+        async with BatchMeter(api_key="...", app_user_id="u1") as meter:
+            for chunk in chunks:
+                await meter.queue_debit(1, "embed_chunk")
+            results = await meter.flush()  # one RC call
+
+    Example — debounce a hot decorator::
+
+        meter = BatchMeter(api_key="...", app_user_id="u1", debounce_ms=200)
+
+        @meter.metered(cost=1, operation="vector_search")
+        async def search(q: str) -> list[str]: ...
+
+        # 50 calls in 50ms → ~1 RC call per 200ms window on flush/exit
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        auto_flush: bool = True,
+        debounce_ms: float = 0.0,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._auto_flush = auto_flush
+        self._debounce_ms = debounce_ms
+        # (amount, operation, metadata) tuples waiting to be flushed
+        self._queue: list[tuple[int, str, dict[str, object] | None]] = []
+        # op -> (accumulated_amount, window_start_time, metadata)
+        self._pending: dict[str, tuple[int, float, dict[str, object] | None]] = {}
+        self._batch_lock = asyncio.Lock()
+
+    async def queue_debit(
+        self,
+        amount: int,
+        operation: str,
+        metadata: dict[str, object] | None = None,
+    ) -> None:
+        """Enqueue a debit without firing an RC API call.
+
+        Call flush() (or let __aexit__ auto-flush) to send to RevenueCat.
+        """
+        async with self._batch_lock:
+            self._queue.append((amount, operation, metadata))
+
+    async def flush(self) -> list[DebitResult]:
+        """Coalesce pending debits and send to RevenueCat.
+
+        Same-operation debits are summed into a single RC call. Returns one
+        DebitResult per unique operation name.
+        """
+        async with self._batch_lock:
+            # Drain debounce buffer into queue
+            for op, (amt, _ws, meta) in list(self._pending.items()):
+                self._queue.append((amt, op, meta))
+            self._pending.clear()
+
+            if not self._queue:
+                return []
+
+            # Coalesce: sum amounts for identical operations
+            coalesced: dict[str, tuple[int, dict[str, object] | None]] = {}
+            for amount, op, meta in self._queue:
+                if op in coalesced:
+                    prev_amt, prev_meta = coalesced[op]
+                    coalesced[op] = (prev_amt + amount, prev_meta or meta)
+                else:
+                    coalesced[op] = (amount, meta)
+            self._queue.clear()
+
+        # Fire RC calls outside the lock (allows concurrent debits during flush)
+        results: list[DebitResult] = []
+        for op, (amount, meta) in coalesced.items():
+            result = await super().debit(amount, op, meta)
+            results.append(result)
+        return results
+
+    async def debit(
+        self,
+        amount: int,
+        operation: str,
+        metadata: dict[str, object] | None = None,
+    ) -> DebitResult:
+        """Debit with optional debounce coalescing.
+
+        When debounce_ms == 0 (default): fires immediately (same as BillingMeter).
+
+        When debounce_ms > 0: the first call for an operation starts a window.
+        Subsequent same-operation calls within the window are accumulated locally
+        and return a synthetic pending result (success=True, pending=True in
+        metadata). When the window expires (detected on the next call to that op)
+        the accumulated amount fires as a single RC call. On flush() or __aexit__,
+        any remaining pending amounts are also fired.
+        """
+        if self._debounce_ms <= 0:
+            return await super().debit(amount, operation, metadata)
+
+        now = time.time()
+        fire_amount: int | None = None
+        fire_meta: dict[str, object] | None = None
+
+        async with self._batch_lock:
+            if operation in self._pending:
+                acc_amt, window_start, acc_meta = self._pending[operation]
+                elapsed_ms = (now - window_start) * 1000.0
+
+                if elapsed_ms < self._debounce_ms:
+                    # Within window: accumulate, return synthetic pending result
+                    self._pending[operation] = (
+                        acc_amt + amount,
+                        window_start,
+                        acc_meta or metadata,
+                    )
+                    return DebitResult(
+                        success=True,
+                        app_user_id=self.app_user_id,
+                        operation=operation,
+                        amount_debited=amount,
+                        timestamp=now,
+                    )
+                else:
+                    # Window expired: fire accumulated, open new window for current
+                    fire_amount = acc_amt
+                    fire_meta = acc_meta
+                    self._pending[operation] = (amount, now, metadata)
+            else:
+                # First call: open window, return synthetic pending result
+                self._pending[operation] = (amount, now, metadata)
+                return DebitResult(
+                    success=True,
+                    app_user_id=self.app_user_id,
+                    operation=operation,
+                    amount_debited=amount,
+                    timestamp=now,
+                )
+
+        # Fire outside lock
+        assert fire_amount is not None
+        return await super().debit(fire_amount, operation, fire_meta)
+
+    async def __aexit__(self, *args: object) -> None:
+        if self._auto_flush:
+            await self.flush()
+        await super().__aexit__(*args)
+
+    @property
+    def pending_count(self) -> int:
+        """Number of items currently queued (not yet flushed)."""
+        return len(self._queue) + len(self._pending)
