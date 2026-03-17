@@ -82,12 +82,47 @@ abm stats
 abm stats --user user_123
 ```
 
+### Spend policies
+
+Declare rules that automatically authorize or deny debits before any API call is made:
+
+```python
+from agent_billing_meter import PolicyMeter
+from agent_billing_meter.policy import SpendPolicy, PolicyViolationError
+
+policy = SpendPolicy(
+    blocked_ops=["purge_all", "send_email"],    # always denied
+    allowed_ops=["llm_call", "embed_chunk"],    # allowlist (None = unrestricted)
+    op_max_per_call={"llm_call": 100},          # max credits per single call
+    op_max_per_hour={"llm_call": 2000},         # rolling 1h cap per operation
+    max_per_hour=5000,                          # rolling 1h cap (all operations)
+    max_per_day=20000,                          # rolling 24h cap (all operations)
+)
+
+async with PolicyMeter(
+    api_key="rc_sk_...",
+    app_user_id="agent_session_xyz",
+    policy=policy,
+) as meter:
+    try:
+        await meter.debit(10, "llm_call")    # ok
+        await meter.debit(200, "llm_call")   # PolicyViolationError — op_max_per_call
+        await meter.debit(1, "purge_all")    # PolicyViolationError — blocked_ops
+    except PolicyViolationError as exc:
+        print(f"Blocked by rule '{exc.rule}': {exc.reason}")
+```
+
+Time-window rules (`op_max_per_hour`, `max_per_hour`, `max_per_day`) query the local SQLite
+audit log — zero extra RC API calls, negligible latency.  All rules are checked before any
+network call: a violation never touches RevenueCat.
+
 ## How it works
 
 1. **`BillingMeter.debit()`** opens an httpx async session and POSTs to RC's virtual currency debit endpoint
 2. Every debit (success or failure) is recorded in a local SQLite audit log (`~/.agent-billing-meter.db`)
 3. The `@metered` decorator wraps async functions — debit fires *after* success, never on exception
 4. `BudgetedMeter` tracks a running session total and raises `BudgetExceededError` before touching the RC API
+5. `PolicyMeter` evaluates a `SpendPolicy` before each debit — violations block the call with zero API contact
 
 ## Part of the agentic billing stack
 

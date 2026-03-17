@@ -11,6 +11,7 @@ from typing import Any, ParamSpec, TypeVar
 from agent_billing_meter.audit_log import AuditLog
 from agent_billing_meter.balance_cache import BalanceCache
 from agent_billing_meter.models import DebitResult
+from agent_billing_meter.policy import SpendPolicy
 from agent_billing_meter.rc_client import RCClient
 
 P = ParamSpec("P")
@@ -430,3 +431,71 @@ class BatchMeter(BillingMeter):
     def pending_count(self) -> int:
         """Number of items currently queued (not yet flushed)."""
         return len(self._queue) + len(self._pending)
+
+
+class PolicyMeter(BillingMeter):
+    """BillingMeter with a declarative SpendPolicy enforced before each debit.
+
+    All policy rules are evaluated synchronously *before* any RevenueCat API
+    call is made.  Violations raise ``PolicyViolationError`` immediately,
+    leaving the subscriber's balance untouched and logging nothing to the
+    audit log.
+
+    Time-window rules (``op_max_per_hour``, ``max_per_hour``, ``max_per_day``)
+    query the local SQLite audit log — they do not make any additional RC API
+    calls and add negligible latency.
+
+    Example::
+
+        from agent_billing_meter import PolicyMeter
+        from agent_billing_meter.policy import SpendPolicy, PolicyViolationError
+
+        policy = SpendPolicy(
+            blocked_ops=["purge_all"],
+            allowed_ops=["llm_call", "embed_chunk"],
+            op_max_per_call={"llm_call": 100},
+            op_max_per_hour={"llm_call": 2000},
+            max_per_hour=5000,
+        )
+
+        async with PolicyMeter(
+            api_key="rc_sk_...",
+            app_user_id="agent_session_xyz",
+            policy=policy,
+        ) as meter:
+            try:
+                await meter.debit(10, "llm_call")    # ok
+                await meter.debit(200, "llm_call")   # raises — op_max_per_call
+            except PolicyViolationError as exc:
+                print(f"Blocked by rule '{exc.rule}': {exc.reason}")
+    """
+
+    def __init__(self, *args: Any, policy: SpendPolicy, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._policy = policy
+
+    async def debit(
+        self,
+        amount: int,
+        operation: str,
+        metadata: dict[str, object] | None = None,
+    ) -> DebitResult:
+        """Check policy rules then delegate to BillingMeter.debit().
+
+        Raises:
+            PolicyViolationError: If any policy rule is violated.  The error is
+                raised *before* any RC API call or audit log write.
+        """
+        # Evaluate synchronously — no RC call, minimal overhead
+        self._policy.check(
+            operation=operation,
+            amount=amount,
+            audit_log=self._audit,
+            app_user_id=self.app_user_id,
+        )
+        return await super().debit(amount, operation, metadata)
+
+    @property
+    def policy(self) -> SpendPolicy:
+        """The active SpendPolicy."""
+        return self._policy

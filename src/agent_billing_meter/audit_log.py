@@ -107,8 +107,15 @@ class AuditLog:
         self,
         app_user_id: str | None = None,
         operation: str | None = None,
+        since: float | None = None,
     ) -> int:
-        """Sum of amount_debited for successful debits matching filters."""
+        """Sum of amount_debited for successful debits matching filters.
+
+        Args:
+            app_user_id: Filter to this user (``None`` = all users).
+            operation: Filter to this operation (``None`` = all operations).
+            since: Only include debits with ``timestamp >= since`` (Unix epoch float).
+        """
         clauses = ["success = 1"]
         params: list[object] = []
 
@@ -118,6 +125,9 @@ class AuditLog:
         if operation:
             clauses.append("operation = ?")
             params.append(operation)
+        if since is not None:
+            clauses.append("timestamp >= ?")
+            params.append(since)
 
         where = "WHERE " + " AND ".join(clauses)
 
